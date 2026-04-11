@@ -21,8 +21,8 @@ data/processed/*
 # Logs & reports
 logs/*
 !logs/.gitkeep
-reports/*
-!reports/.gitkeep
+# reports/*
+# !reports/.gitkeep
 
 # Models
 *.pkl
