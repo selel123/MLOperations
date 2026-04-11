@@ -15,10 +15,7 @@ Metriken:
                ROC-AUC – schwellenwertunabhängige Gesamtperformance
 
 Run:
-    python train.py                   → alle Runs (Baseline + optimierte Varianten)
-    python train.py --model lr        → nur LR mit Standardparametern
-    python train.py --model rf --n_estimators 200 --max_depth 10
-    python train.py --model gb --n_estimators 200 --max_depth 5 --learning_rate 0.05
+    python train.py --all          → alle Modelle mit GridSearchCV tunen
 """
 
 import argparse
@@ -43,6 +40,8 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from sklearn.inspection import permutation_importance
+from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
@@ -51,13 +50,13 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
-TRACKING_URI = "http://localhost:5000"
+TRACKING_URI = "http://46.225.163.17:5000"
 EXPERIMENT_NAME = "classification-ml"
 DATA_PATH = Path("data/raw/train_full.csv")
 TARGET = "risk_flag"
 SPLIT_DATE = "2025-04-01"
 
-# log1p-Transformation bei Skewness > 0.75 (außer binäre Flags)
+# log1p nur für stark skewed Features (Skewness > 0.75, EDA-basiert)
 LOG_FEATURES = [
     "transaction_volume",
     "processing_time_hours",
@@ -74,84 +73,31 @@ PLAIN_FEATURES = [
 NUMERIC_FEATURES = LOG_FEATURES + PLAIN_FEATURES
 CATEGORICAL_FEATURES = ["region", "channel", "customer_segment", "product_line"]
 
-# Capping auf 99. Perzentil (echte Ausreißer in diesen Features)
+# Capping auf 99. Perzentil (echte Ausreißer in diesen Features, EDA-basiert)
 CAPPING_FEATURES = ["historical_incidents_90d", "processing_time_hours", "transaction_volume"]
 
 # ---------------------------------------------------------------------------
-# Alle Runs: Baseline + optimierte Varianten
+# Modell-Registry — neue Modelle hier ergänzen!!
 # ---------------------------------------------------------------------------
-ALL_RUNS = [
-    # Baseline: LR mit Standardparametern, kein Tuning
-    {
-        "run_name": "LR_baseline",
-        "model":    "lr",
-        "params":   {"C": 1.0, "max_iter": 1000},
-    },
-    # LR – verschiedene Regularisierungsstärken
-    {
-        "run_name": "LR_C0.01",
-        "model":    "lr",
-        "params":   {"C": 0.01, "max_iter": 1000},
-    },
-    {
-        "run_name": "LR_C0.1",
-        "model":    "lr",
-        "params":   {"C": 0.1, "max_iter": 1000},
-    },
-    {
-        "run_name": "LR_C10",
-        "model":    "lr",
-        "params":   {"C": 10.0, "max_iter": 1000},
-    },
-    # RF – Tiefe und Baumanzahl variiert
-    {
-        "run_name": "RF_d5_n100",
-        "model":    "rf",
-        "params":   {"n_estimators": 100, "max_depth": 5},
-    },
-    {
-        "run_name": "RF_d10_n100",
-        "model":    "rf",
-        "params":   {"n_estimators": 100, "max_depth": 10},
-    },
-    {
-        "run_name": "RF_d10_n200",
-        "model":    "rf",
-        "params":   {"n_estimators": 200, "max_depth": 10},
-    },
-    {
-        "run_name": "RF_d15_n200",
-        "model":    "rf",
-        "params":   {"n_estimators": 200, "max_depth": 15},
-    },
-    # GB – Lernrate und Tiefe variiert
-    {
-        "run_name": "GB_lr0.1_d3_n100",
-        "model":    "gb",
-        "params":   {"n_estimators": 100, "max_depth": 3, "learning_rate": 0.1},
-    },
-    {
-        "run_name": "GB_lr0.05_d3_n200",
-        "model":    "gb",
-        "params":   {"n_estimators": 200, "max_depth": 3, "learning_rate": 0.05},
-    },
-    {
-        "run_name": "GB_lr0.1_d5_n200",
-        "model":    "gb",
-        "params":   {"n_estimators": 200, "max_depth": 5, "learning_rate": 0.1},
-    },
-    {
-        "run_name": "GB_lr0.05_d5_n300",
-        "model":    "gb",
-        "params":   {"n_estimators": 300, "max_depth": 5, "learning_rate": 0.05},
-    },
-]
+MODELS = {
+    "lr": LogisticRegression,
+    "rf": RandomForestClassifier,
+    "gb": GradientBoostingClassifier,
+}
+
+# Feste Modell Argumente 
+MODEL_FIXED_KWARGS = {
+    "lr": {"class_weight": "balanced", "random_state": 42, "solver": "lbfgs", "max_iter": 1000},
+    "rf": {"class_weight": "balanced", "random_state": 42, "n_jobs": -1},
+    "gb": {"random_state": 42},
+}
 
 
 # ---------------------------------------------------------------------------
-# Daten laden & zeitbasierter Split
+# 1. load_data
 # ---------------------------------------------------------------------------
-def load_and_split(path: Path):
+def load_data(path: Path = DATA_PATH):
+    """Daten laden, zeitbasiert splitten, Capping auf Trainingsdaten berechnen."""
     df = pd.read_csv(path, parse_dates=["timestamp"])
 
     train_df = df[df["timestamp"] < SPLIT_DATE].copy()
@@ -177,9 +123,15 @@ def load_and_split(path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Pipeline
+# 2. build_preprocessor
 # ---------------------------------------------------------------------------
-def build_pipeline(model: str, params: dict) -> Pipeline:
+def build_preprocessor() -> ColumnTransformer:
+    """Preprocessing-Pipeline getrennt vom Modellcode.
+
+    log1p: nur stark skewed Features (EDA-basiert, Skewness > 0.75)
+    StandardScaler: alle numerischen Features
+    OneHotEncoder: kategoriale Features
+    """
     log_transformer = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("log1p",   FunctionTransformer(np.log1p)),
@@ -193,145 +145,228 @@ def build_pipeline(model: str, params: dict) -> Pipeline:
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("onehot",  OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
     ])
-    preprocessor = ColumnTransformer([
+    return ColumnTransformer([
         ("log",   log_transformer,         LOG_FEATURES),
         ("plain", plain_transformer,       PLAIN_FEATURES),
         ("cat",   categorical_transformer, CATEGORICAL_FEATURES),
     ])
 
-    if model == "lr":
-        classifier = LogisticRegression(
-            C=params.get("C", 1.0),
-            max_iter=params.get("max_iter", 1000),
-            class_weight="balanced",
-            random_state=42,
-            solver="lbfgs",
-        )
-    elif model == "rf":
-        classifier = RandomForestClassifier(
-            n_estimators=params.get("n_estimators", 100),
-            max_depth=params.get("max_depth", None),
-            class_weight="balanced",
-            random_state=42,
-            n_jobs=-1,
-        )
-    elif model == "gb":
-        classifier = GradientBoostingClassifier(
-            n_estimators=params.get("n_estimators", 100),
-            max_depth=params.get("max_depth", 3),
-            learning_rate=params.get("learning_rate", 0.1),
-            random_state=42,
-        )
 
-    return Pipeline([("preprocessor", preprocessor), ("classifier", classifier)])
+# ---------------------------------------------------------------------------
+# 3. get_model
+# ---------------------------------------------------------------------------
+def get_model(model_name: str) -> Pipeline:
+    """Gibt eine vollständige sklearn Pipeline (Preprocessor + Classifier) zurück."""
+    if model_name not in MODELS:
+        raise ValueError(f"Unbekanntes Modell: '{model_name}'. Verfügbar: {list(MODELS)}")
+
+    classifier = MODELS[model_name](**MODEL_FIXED_KWARGS[model_name])
+    return Pipeline([
+        ("preprocessor", build_preprocessor()),
+        ("classifier",   classifier),
+    ])
 
 
 # ---------------------------------------------------------------------------
-# Metriken & Visualisierung
+# 4. get_param_grid
 # ---------------------------------------------------------------------------
-def compute_metrics(y_true, y_pred, y_prob, prefix: str) -> dict:
-    return {
-        f"{prefix}_f1":        f1_score(y_true, y_pred),
-        f"{prefix}_recall":    recall_score(y_true, y_pred),
-        f"{prefix}_precision": precision_score(y_true, y_pred, zero_division=0),
-        f"{prefix}_roc_auc":   roc_auc_score(y_true, y_prob),
+def get_param_grid(model_name: str) -> dict:
+    """Hyperparameter-Suchraum pro Modell für GridSearchCV."""
+    param_grids = {
+        "lr": {
+            "classifier__C": [0.01, 0.1, 1, 10],
+        },
+        "rf": {
+            "classifier__n_estimators": [100, 200],
+            "classifier__max_depth":    [5, 10, 15],
+        },
+        "gb": {
+            "classifier__n_estimators":  [100, 200],
+            "classifier__max_depth":     [3, 5],
+            "classifier__learning_rate": [0.05, 0.1],
+        },
+    }
+    return param_grids[model_name]
+
+
+# ---------------------------------------------------------------------------
+# 5. tune_model
+# ---------------------------------------------------------------------------
+def tune_model(model_name: str, X_train, y_train) -> GridSearchCV:
+    """GridSearchCV auf Trainingsdaten — gibt das fertig gefittete Objekt zurück."""
+    pipeline   = get_model(model_name)
+    param_grid = get_param_grid(model_name)
+
+    search = GridSearchCV(
+        pipeline,
+        param_grid,
+        scoring="f1",
+        cv=3,
+        n_jobs=-1,
+        refit=True,
+    )
+    search.fit(X_train, y_train)
+
+    print(f"  Beste Params: {search.best_params_}")
+    print(f"  Bestes CV-F1: {search.best_score_:.4f}")
+
+    return search
+
+
+# ---------------------------------------------------------------------------
+# 6. evaluate_model
+# ---------------------------------------------------------------------------
+def evaluate_model(model, X_test, y_test, model_name: str):
+    """Testset-Evaluation — gibt Metriken-Dict und Confusion-Matrix-Figure zurück."""
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+
+    metrics = {
+        "test_f1":        f1_score(y_test, y_pred),
+        "test_recall":    recall_score(y_test, y_pred),
+        "test_precision": precision_score(y_test, y_pred, zero_division=0),
+        "test_roc_auc":   roc_auc_score(y_test, y_prob),
     }
 
+    print(f"\n{'─'*30} Test  {'─'*30}")
+    for k, v in metrics.items():
+        print(f"  {k:<25} {v:.4f}")
+    print(f"\n{classification_report(y_test, y_pred, target_names=['no risk', 'risk'])}")
 
-def plot_confusion_matrix(y_true, y_pred, run_name: str) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(5, 4))
     ConfusionMatrixDisplay.from_predictions(
-        y_true, y_pred,
+        y_test, y_pred,
         display_labels=["no risk", "risk"],
         ax=ax,
         colorbar=False,
     )
-    ax.set_title(f"Confusion Matrix – {run_name}")
+    ax.set_title(f"Confusion Matrix – {model_name}")
     plt.tight_layout()
-    return fig
+
+    return metrics, fig
 
 
 # ---------------------------------------------------------------------------
-# Einzelner MLflow Run
+# 7. compute_feature_importance
 # ---------------------------------------------------------------------------
-def run_single(run_name: str, model: str, params: dict, X_train, X_test, y_train, y_test):
-    print(f"\n{'='*60}")
-    print(f"Starte: {run_name}  |  params: {params}")
-    print("=" * 60)
+def compute_feature_importance(model, X_test, y_test, model_name: str):
+    """Permutation Importance auf dem Testset — nach GridSearch.
 
-    pipeline = build_pipeline(model, params)
+    Feature-Namen werden direkt aus der Pipeline (ColumnTransformer) extrahiert.
+    Gibt einen sortierten DataFrame zurück und speichert ihn als CSV.
+    """
+    feature_names = X_test.columns
+    # Präfixe (log__, plain__, cat__) entfernen für bessere Lesbarkeit
+    feature_names = [n.split("__", 1)[-1] for n in feature_names]
+
+    result = permutation_importance(
+        model, X_test, y_test,
+        scoring="f1",
+        n_repeats=10,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+    importance_df = pd.DataFrame({
+        "feature":          feature_names,
+        "importance_mean":  result.importances_mean,
+        "importance_std":   result.importances_std,
+    }).sort_values("importance_mean", ascending=False).reset_index(drop=True)
+
+    csv_path = Path(f"feature_importance_{model_name}.csv")
+    importance_df.to_csv(csv_path, index=False)
+
+    print(f"\n{'─'*30} Feature Importance ({model_name}) {'─'*10}")
+    print(importance_df.head(10).to_string(index=False))
+
+    return importance_df, csv_path
+
+
+# ---------------------------------------------------------------------------
+# 8. run_exists
+# ---------------------------------------------------------------------------
+def run_exists(model_name: str, best_params: dict) -> bool:
+    """Prüft ob ein identischer Run (Modell + Parameter) bereits in MLflow existiert."""
+    try:
+        runs = mlflow.search_runs(search_all_experiments=False)
+    except Exception:
+        return False
+
+    if runs.empty:
+        return False
+
+    for _, run in runs.iterrows():
+        if run.get("params.model") != model_name:
+            continue
+        if all(
+            str(run.get(f"params.{k}")) == str(v)
+            for k, v in best_params.items()
+        ):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 9. log_to_mlflow
+# ---------------------------------------------------------------------------
+def log_to_mlflow(model_name: str, best_params: dict, best_model,
+                  metrics: dict, confusion_fig, importance_csv: Path, X_train):
+    """Loggt einen einzigen Run pro Modell — keine CV-Folds, keine Einzelkombinationen."""
+    run_name = f"{model_name.upper()}_tuned"
 
     with mlflow.start_run(run_name=run_name):
-        pipeline.fit(X_train, y_train)
+        mlflow.log_param("model", model_name)
+        mlflow.log_param("split_date", SPLIT_DATE)
+        mlflow.log_params(best_params)
+        mlflow.log_metrics(metrics)
 
-        y_pred_train = pipeline.predict(X_train)
-        y_pred_test  = pipeline.predict(X_test)
-        y_prob_train = pipeline.predict_proba(X_train)[:, 1]
-        y_prob_test  = pipeline.predict_proba(X_test)[:, 1]
+        mlflow.log_figure(confusion_fig, "confusion_matrix.png")
+        mlflow.log_artifact(str(importance_csv), artifact_path="feature_importance")
 
-        train_metrics = compute_metrics(y_train, y_pred_train, y_prob_train, prefix="train")
-        test_metrics  = compute_metrics(y_test,  y_pred_test,  y_prob_test,  prefix="test")
+        signature = infer_signature(X_train, best_model.predict(X_train))
+        mlflow.sklearn.log_model(
+            best_model,
+            name="model",
+            signature=signature,
+            input_example=X_train.iloc[:3],
+        )
 
-        mlflow.log_params({"model": model, "split_date": SPLIT_DATE,
-                           "train_size": len(X_train), "test_size": len(X_test), **params})
-        mlflow.log_metrics({**train_metrics, **test_metrics})
-
-        fig = plot_confusion_matrix(y_test, y_pred_test, run_name)
-        mlflow.log_figure(fig, "confusion_matrix.png")
-        plt.close(fig)
-
-        signature = infer_signature(X_train, pipeline.predict(X_train))
-        mlflow.sklearn.log_model(pipeline, name="model", signature=signature,
-                                 input_example=X_train.iloc[:3])
-
-        print(f"\n{'─'*30} Train {'─'*30}")
-        for k, v in train_metrics.items():
-            print(f"  {k:<25} {v:.4f}")
-        print(f"\n{'─'*30} Test  {'─'*30}")
-        for k, v in test_metrics.items():
-            print(f"  {k:<25} {v:.4f}")
-        print(f"\n{classification_report(y_test, y_pred_test, target_names=['no risk', 'risk'])}")
         print(f"MLflow Run ID: {mlflow.active_run().info.run_id}")
 
+    plt.close(confusion_fig)
+
 
 # ---------------------------------------------------------------------------
-# Hauptfunktion
+# 10. main
 # ---------------------------------------------------------------------------
-def train_all():
-    """Startet alle Runs sequentiell: Baseline LR + optimierte Varianten."""
+def main(model_names: list):
     mlflow.set_tracking_uri(TRACKING_URI)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
-    X_train, X_test, y_train, y_test = load_and_split(DATA_PATH)
+    X_train, X_test, y_train, y_test = load_data()
 
-    print(f"\n{len(ALL_RUNS)} Runs werden gestartet ...")
-    for run_cfg in ALL_RUNS:
-        run_single(run_cfg["run_name"], run_cfg["model"], run_cfg["params"],
-                   X_train, X_test, y_train, y_test)
+    for model_name in model_names:
+        print(f"\n{'='*60}")
+        print(f"Modell: {model_name.upper()}  |  GridSearchCV startet ...")
+        print("=" * 60)
+
+        search      = tune_model(model_name, X_train, y_train)
+        best_model  = search.best_estimator_
+        best_params = {
+            k.replace("classifier__", ""): v
+            for k, v in search.best_params_.items()
+        }
+
+        if run_exists(model_name, best_params):
+            print(f"  Run existiert bereits (Modell={model_name}, Params={best_params}) → skip")
+            continue
+
+        metrics, confusion_fig           = evaluate_model(best_model, X_test, y_test, model_name)
+        _, importance_csv                 = compute_feature_importance(best_model, X_test, y_test, model_name)
+        log_to_mlflow(model_name, best_params, best_model, metrics, confusion_fig, importance_csv, X_train)
 
     print(f"\n{'='*60}")
-    print(f"Alle {len(ALL_RUNS)} Runs abgeschlossen.")
-    print(f"Experiment: {EXPERIMENT_NAME}  |  Tracking: {TRACKING_URI}")
-
-
-def train_single(args):
-    """Startet einen einzelnen Run basierend auf CLI-Argumenten."""
-    mlflow.set_tracking_uri(TRACKING_URI)
-    mlflow.set_experiment(EXPERIMENT_NAME)
-
-    X_train, X_test, y_train, y_test = load_and_split(DATA_PATH)
-
-    model_labels = {"lr": "LogisticRegression", "rf": "RandomForest", "gb": "GradientBoosting"}
-    if args.model == "lr":
-        params = {"C": args.C, "max_iter": args.max_iter}
-    elif args.model == "rf":
-        params = {"n_estimators": args.n_estimators, "max_depth": args.max_depth}
-    elif args.model == "gb":
-        params = {"n_estimators": args.n_estimators, "max_depth": args.max_depth,
-                  "learning_rate": args.learning_rate}
-
-    run_single(model_labels[args.model], args.model, params, X_train, X_test, y_train, y_test)
-    print(f"\nExperiment: {EXPERIMENT_NAME}  |  Tracking: {TRACKING_URI}")
+    print(f"Fertig. Experiment: {EXPERIMENT_NAME}  |  Tracking: {TRACKING_URI}")
 
 
 # ---------------------------------------------------------------------------
@@ -339,45 +374,19 @@ def train_single(args):
 # ---------------------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="Risk Flag Classification Training mit MLflow")
-    parser.add_argument("--model", type=str, default=None, choices=["lr", "rf", "gb"],
-                        help="Einzelnes Modell trainieren. Ohne Angabe: alle Runs.")
-    # LR
-    parser.add_argument("--C",             type=float, default=1.0,  help="LR: Regularisierungsstärke")
-    parser.add_argument("--max_iter",      type=int,   default=1000, help="LR: Max. Iterationen")
-    # RF + GB
-    parser.add_argument("--n_estimators",  type=int,   default=100,  help="RF/GB: Anzahl Bäume")
-    parser.add_argument("--max_depth",     type=int,   default=None, help="RF/GB: Max. Tiefe")
-    # GB
-    parser.add_argument("--learning_rate", type=float, default=0.1,  help="GB: Lernrate")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--model", type=str, choices=list(MODELS),
+        help="Einzelnes Modell tunen und loggen.",
+    )
+    group.add_argument(
+        "--all", action="store_true",
+        help="Alle Modelle tunen und loggen.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.model is None:
-        train_all()
-    else:
-        train_single(args)
-
-
-"""
-Analyse Baseline-Modell – Logistische Regression (C=1.0)
-                                                                                                                                     
-  Kein Overfitting: Train- und Test-Metriken liegen sehr nah beieinander (train_f1=0.577 vs. test_f1=0.560, train_roc_auc=0.730 vs.
-  test_roc_auc=0.719). Das Modell generalisiert stabil auf den April-Testdaten.                                                      
-                                          
-  Recall vor Precision: Der Recall von 0.636 bedeutet, dass das Modell ~64% aller echten Risikofälle korrekt erkennt. Gemäß der      
-  Problemstellung (False Negatives sind kritischer als False Positives) ist das die relevante Größe. Die Precision von 0.50 zeigt,
-  dass jeder zweite Alarm ein False Positive ist — bei einem Screening-System vor manueller Prüfung akzeptabel.                      
-                                          
-  ROC-AUC 0.72: Das Modell ist deutlich besser als Random (0.5), aber weit von perfekter Trennung (1.0) entfernt. Das entspricht dem 
-  EDA-Befund: kein Feature hat eine starke Einzelkorrelation mit dem Target (Maximum r=0.355 bei transaction_volume). Die schwache
-  Trennbarkeit ist datensatzbedingt, nicht modellbedingt.                                                                            
-                                          
-  Klassenimbalance kompensiert: Durch class_weight="balanced" werden beide Klassen gleich gewichtet. Ohne diesen Parameter würde das 
-  Modell die Mehrheitsklasse (65% kein Risiko) bevorzugen und Recall deutlich schlechter.
-                                                                                                                                     
-  Fazit: Das Baseline-Modell ist solide und gut kalibriert — die Performance ist durch die Datenlage begrenzt, nicht durch den       
-  Algorithmus. Kein anderes getestetes Modell konnte es übertreffen.
-                                                                          
-"""
+    models_to_run = list(MODELS) if args.all else [args.model]
+    main(models_to_run)
