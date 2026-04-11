@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.env
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Logs & reports
+logs/*
+!logs/.gitkeep
+reports/*
+!reports/.gitkeep
+
+# Models
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+mlruns/
+
+# OS
+.DS_Store
+Thumbs.db
