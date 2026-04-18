@@ -97,8 +97,8 @@ MODEL_FIXED_KWARGS = {
     "lr": {"class_weight": "balanced", "random_state": 42, "solver": "lbfgs", "max_iter": 1000},
     "rf": {"class_weight": "balanced", "random_state": 42, "n_jobs": -1},
     "gb": {"random_state": 42},
-    "lgbm": {"is_unbalance": True, "random_state": 42, "n_jobs": -1, "verbose": -1},
-    "xgb": {"random_state": 42, "n_jobs": -1, "eval_metric": "logloss"},
+    "lgbm": {"is_unbalance": True, "random_state": 42, "n_jobs": 1, "verbose": -1},
+    "xgb": {"random_state": 42, "n_jobs": 1, "eval_metric": "logloss"},
     "svm":  {"class_weight": "balanced", "probability": True, "kernel": "rbf"},
 }
 
