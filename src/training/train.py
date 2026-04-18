@@ -30,6 +30,7 @@ import pandas as pd
 from mlflow.models import infer_signature
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.svm import SVC
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -44,6 +45,9 @@ from sklearn.inspection import permutation_importance
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
+
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 
 warnings.filterwarnings("ignore")
 
@@ -83,6 +87,9 @@ MODELS = {
     "lr": LogisticRegression,
     "rf": RandomForestClassifier,
     "gb": GradientBoostingClassifier,
+    "lgbm": LGBMClassifier,
+    "xgb": XGBClassifier,
+    "svm": SVC,
 }
 
 # Feste Modell Argumente 
@@ -90,6 +97,9 @@ MODEL_FIXED_KWARGS = {
     "lr": {"class_weight": "balanced", "random_state": 42, "solver": "lbfgs", "max_iter": 1000},
     "rf": {"class_weight": "balanced", "random_state": 42, "n_jobs": -1},
     "gb": {"random_state": 42},
+    "lgbm": {"is_unbalance": True, "random_state": 42, "n_jobs": -1, "verbose": -1},
+    "xgb": {"random_state": 42, "n_jobs": -1, "eval_metric": "logloss"},
+    "svm":  {"class_weight": "balanced", "probability": True, "kernel": "rbf"},
 }
 
 
@@ -184,6 +194,21 @@ def get_param_grid(model_name: str) -> dict:
             "classifier__n_estimators":  [100, 200],
             "classifier__max_depth":     [3, 5],
             "classifier__learning_rate": [0.05, 0.1],
+        },
+        "lgbm": {
+            "classifier__num_leaves":        [15, 31, 63],
+            "classifier__n_estimators":      [100, 200],
+            "classifier__learning_rate":     [0.05, 0.1],
+            "classifier__min_child_samples": [10, 20, 50],
+        },
+        "xgb": {
+            "classifier__n_estimators":  [100, 200],
+            "classifier__max_depth":     [3, 5],
+            "classifier__learning_rate": [0.05, 0.1],
+        },
+        "svm": {
+            "classifier__C":     [0.1, 1, 10],
+            "classifier__gamma": ["scale", "auto"],
         },
     }
     return param_grids[model_name]
