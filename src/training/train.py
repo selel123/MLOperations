@@ -15,7 +15,7 @@ Metriken:
                ROC-AUC – schwellenwertunabhängige Gesamtperformance
 
 Run:
-    python train.py --all          → alle Modelle mit GridSearchCV tunen
+    python src/training/train.py --all          → alle Modelle mit GridSearchCV tunen
 """
 
 import argparse
@@ -43,6 +43,7 @@ from sklearn.metrics import (
 )
 from sklearn.inspection import permutation_importance
 from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
@@ -155,6 +156,8 @@ def build_preprocessor() -> ColumnTransformer:
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("onehot",  OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
     ])
+
+    
     return ColumnTransformer([
         ("log",   log_transformer,         LOG_FEATURES),
         ("plain", plain_transformer,       PLAIN_FEATURES),
@@ -226,7 +229,7 @@ def tune_model(model_name: str, X_train, y_train) -> GridSearchCV:
         pipeline,
         param_grid,
         scoring="f1",
-        cv=3,
+        cv=TimeSeriesSplit(3),
         n_jobs=-1,
         refit=True,
     )
