@@ -20,7 +20,7 @@ class InputData(BaseModel):
     processing_time_hours: float
     historical_incidents_90d: int
     open_cases_count: int
-    customer_tenure_months: int
+    customer_tenure_months: float
     change_requests_30d: int
     missing_docs_flag: int
     high_priority_source_flag: int
