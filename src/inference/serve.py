@@ -15,7 +15,7 @@ MODEL_NAME     = "LGBM-RiskClassification"
 # Modell beim Start laden
 # ---------------------------------------------------------------------------
 mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", TRACKING_URI))
-model = mlflow.pyfunc.load_model(f"models:/{MODEL_NAME}@production")
+model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@production")
 
 print(f"✅ Modell geladen")
 
