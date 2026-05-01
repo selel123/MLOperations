@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
-TRACKING_URI    = "http://46.225.163.17:5000"
+TRACKING_URI    = "http://localhost:5000"
 EXPERIMENT_NAME = "classification-ml"
 MODEL_NAME      = "LGBM-RiskClassification"
 TRAIN_PATH      = Path("data/raw/train_full.csv")
