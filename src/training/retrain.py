@@ -108,7 +108,7 @@ def run_retraining(wave_paths: list[Path]):
     }
     print(f"F1={metrics['retrain_f1']}  AUC={metrics['retrain_roc_auc']}")
 
-    # 4. In MLflow loggen & als @staging registrieren
+    # 4. In MLflow loggen (ohne Registry — separat registrieren)
     with mlflow.start_run(run_name="LGBM_retrained") as run:
         mlflow.log_param("waves", [str(p) for p in wave_paths])
         mlflow.log_metrics(metrics)
@@ -119,14 +119,16 @@ def run_retraining(wave_paths: list[Path]):
             name="model",
             signature=signature,
             input_example=X_train.iloc[:3],
-            registered_model_name=MODEL_NAME,
         )
         run_id = run.info.run_id
 
-    # Alias @staging setzen — neueste Version anhand run_id suchen
-    client   = mlflow.MlflowClient()
-    versions = client.search_model_versions(f"name='{MODEL_NAME}'")
-    version  = next(v for v in versions if v.run_id == run_id)
+    # Neue Version in Registry anlegen (bestehende @production bleibt unberührt)
+    client  = mlflow.MlflowClient()
+    version = client.create_model_version(
+        name=MODEL_NAME,
+        source=f"runs:/{run_id}/model",
+        run_id=run_id,
+    )
     client.set_registered_model_alias(MODEL_NAME, "staging", version.version)
 
     print(f"\nModell registriert: {MODEL_NAME} v{version.version} @staging")
