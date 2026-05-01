@@ -123,9 +123,10 @@ def run_retraining(wave_paths: list[Path]):
         )
         run_id = run.info.run_id
 
-    # Alias @staging setzen
-    client  = mlflow.MlflowClient()
-    version = client.get_model_version_by_run_id(MODEL_NAME, run_id)
+    # Alias @staging setzen — neueste Version anhand run_id suchen
+    client   = mlflow.MlflowClient()
+    versions = client.search_model_versions(f"name='{MODEL_NAME}'")
+    version  = next(v for v in versions if v.run_id == run_id)
     client.set_registered_model_alias(MODEL_NAME, "staging", version.version)
 
     print(f"\nModell registriert: {MODEL_NAME} v{version.version} @staging")
