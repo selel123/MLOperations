@@ -1,10 +1,267 @@
-"""Entry point for model monitoring."""
+"""
+Monitoring Pipeline – Drift-Erkennung & Retraining-Trigger
+
+PSI < 0.10   → stabil
+PSI 0.10–0.25 → Warnung
+PSI > 0.25   → kritischer Drift → retrain.py wird aufgerufen
+F1-Abfall >= 5% → retrain.py wird aufgerufen
+
+Usage:
+    python monitor.py --waves data/raw/production_wave_2.csv data/raw/production_wave_3.csv
+    python monitor.py --waves data/raw/production_wave_2.csv --no-retrain
+"""
+
+import argparse
+import subprocess
+import sys
+import warnings
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# Konfiguration
+# ---------------------------------------------------------------------------
+TRACKING_URI  = "http://46.225.163.17:5000"
+MODEL_NAME    = "LGBM-RiskClassification"
+TRAIN_PATH    = Path("data/raw/train_full.csv")
+REPORTS_DIR   = Path("reports")
+
+PSI_WARN      = 0.10
+PSI_CRITICAL  = 0.25
+F1_DROP       = 0.05
+F1_REF        = 0.564
+
+NUMERIC_FEATURES = [
+    "transaction_volume", "processing_time_hours",
+    "historical_incidents_90d", "open_cases_count",
+    "customer_tenure_months", "change_requests_30d",
+]
+ALL_FEATURES = NUMERIC_FEATURES + [
+    "missing_docs_flag", "high_priority_source_flag",
+    "region", "channel", "customer_segment", "product_line",
+]
 
 
-def main():
-    print("Starting model monitoring...")
-    # TODO: implement monitoring logic
+# ---------------------------------------------------------------------------
+# Drift-Metriken
+# ---------------------------------------------------------------------------
+def compute_psi(reference: pd.Series, current: pd.Series, bins: int = 10) -> float:
+    """PSI: wie stark hat sich die Verteilung eines Features verändert?"""
+    breakpoints = np.unique(np.percentile(reference.dropna(), np.linspace(0, 100, bins + 1)))
+    if len(breakpoints) < 3:
+        return 0.0
+    ref_pct = np.histogram(reference.dropna(), bins=breakpoints)[0] / len(reference.dropna())
+    cur_pct = np.histogram(current.dropna(),   bins=breakpoints)[0] / len(current.dropna())
+    ref_pct = np.where(ref_pct == 0, 1e-6, ref_pct)
+    cur_pct = np.where(cur_pct == 0, 1e-6, cur_pct)
+    return float(np.sum((cur_pct - ref_pct) * np.log(cur_pct / ref_pct)))
 
 
+def compute_ks(reference: pd.Series, current: pd.Series) -> tuple[float, float]:
+    """KS-Test: p-Wert < 0.05 bedeutet signifikanter Unterschied."""
+    stat, pval = stats.ks_2samp(reference.dropna(), current.dropna())
+    return round(float(stat), 4), round(float(pval), 6)
+
+
+# ---------------------------------------------------------------------------
+# Performance
+# ---------------------------------------------------------------------------
+def evaluate_performance(model, df: pd.DataFrame, wave_name: str) -> dict:
+    """F1, Recall, Precision, AUC für eine Wave — braucht echte Labels (risk_flag)."""
+    from sklearn.metrics import f1_score, recall_score, precision_score, roc_auc_score
+    X, y   = df[ALL_FEATURES], df["risk_flag"]
+    y_pred = model.predict(X)
+    y_prob = model.predict_proba(X)[:, 1]
+    return {
+        "wave":      wave_name,
+        "f1":        round(f1_score(y, y_pred, zero_division=0), 4),
+        "recall":    round(recall_score(y, y_pred, zero_division=0), 4),
+        "precision": round(precision_score(y, y_pred, zero_division=0), 4),
+        "roc_auc":   round(roc_auc_score(y, y_prob), 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Plots
+# ---------------------------------------------------------------------------
+def plot_psi(psi_df: pd.DataFrame):
+    """Balkendiagramm: PSI pro Feature, eine Spalte pro Wave."""
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    waves = psi_df["wave"].unique()
+    n = len(waves)
+    features = psi_df.groupby("feature")["psi"].max().sort_values().index
+
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, max(3, len(features) * 0.45)), sharey=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, wave in zip(axes, waves):
+        df = psi_df[psi_df["wave"] == wave].set_index("feature")["psi"].reindex(features)
+        colors = ["#E53935" if v >= PSI_CRITICAL else "#FB8C00" if v >= PSI_WARN else "#43A047"
+                  for v in df.values]
+        ax.barh(df.index, df.values, color=colors, height=0.6)
+        ax.axvline(PSI_WARN,     linestyle="--", color="#FB8C00", linewidth=1.2, label=f"Warn ({PSI_WARN})")
+        ax.axvline(PSI_CRITICAL, linestyle="--", color="#E53935", linewidth=1.2, label=f"Kritisch ({PSI_CRITICAL})")
+        ax.set_xlabel("PSI")
+        ax.set_title(wave, fontweight="bold")
+        ax.legend(fontsize=8)
+
+    fig.suptitle("PSI pro Feature", fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    path = REPORTS_DIR / "psi.png"
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Plot gespeichert: {path}")
+
+
+def plot_performance(perf_rows: list):
+    """Liniendiagramm: F1, Recall, Precision, AUC über alle Waves."""
+    if not perf_rows:
+        return
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(perf_rows)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for metric, color in [("f1", "#2196F3"), ("recall", "#4CAF50"),
+                          ("precision", "#FF9800"), ("roc_auc", "#9C27B0")]:
+        ax.plot(df["wave"], df[metric], "-o", color=color, linewidth=2, label=metric.upper())
+    ax.axhline(F1_REF,          linestyle="--", color="#E53935", linewidth=1.2, label=f"F1-Ref ({F1_REF})")
+    ax.axhline(F1_REF - F1_DROP, linestyle=":",  color="#E53935", linewidth=1.0, label=f"Trigger ({F1_REF - F1_DROP:.2f})")
+    ax.set_ylim(0, 1)
+    ax.set_title("Modell-Performance im Zeitverlauf", fontweight="bold")
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    path = REPORTS_DIR / "performance.png"
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Plot gespeichert: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Hauptpipeline
+# ---------------------------------------------------------------------------
+def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
+    print("=" * 60)
+    print("MLOps Monitoring Pipeline")
+    print("=" * 60)
+
+    # 1. Trainingsdaten als Referenz laden
+    train_df = pd.read_csv(TRAIN_PATH, parse_dates=["timestamp"])
+    train_df = train_df[train_df["timestamp"] < "2025-04-01"]
+    print(f"\nReferenz (Training): {len(train_df):,} Zeilen")
+
+    # 2. Production Waves laden
+    waves = [{"name": p.stem.replace("_", " ").title(),
+              "df":   pd.read_csv(p, parse_dates=["timestamp"])}
+             for p in wave_paths]
+    for w in waves:
+        print(f"{w['name']}: {len(w['df']):,} Zeilen")
+
+    # 3. Modell aus MLflow laden
+    model = None
+    try:
+        import mlflow.sklearn
+        import mlflow
+        mlflow.set_tracking_uri(TRACKING_URI)
+        client = mlflow.MlflowClient()
+        version = client.get_model_version_by_alias(MODEL_NAME, "production")
+        run_id  = version.run_id
+        model   = mlflow.sklearn.load_model(f"runs:/{run_id}/model")
+        print(f"\nModell geladen: {MODEL_NAME}@production (run_id={run_id})")
+    except Exception as e:
+        print(f"\nWARNUNG: Modell nicht geladen ({e})")
+
+    # 4. PSI & KS pro Feature & Wave berechnen
+    psi_rows = []
+    for wave in waves:
+        for feat in NUMERIC_FEATURES:
+            ks_stat, ks_pval = compute_ks(train_df[feat], wave["df"][feat])
+            psi_rows.append({
+                "feature": feat,
+                "wave":    wave["name"],
+                "psi":     round(compute_psi(train_df[feat], wave["df"][feat]), 4),
+                "ks_stat": ks_stat,
+                "ks_pval": ks_pval,
+            })
+    psi_df = pd.DataFrame(psi_rows)
+
+    # 5. Performance pro Wave berechnen (nur wenn Modell geladen & Labels vorhanden)
+    perf_rows = []
+    if model:
+        for wave in waves:
+            if "risk_flag" in wave["df"].columns:
+                perf_rows.append(evaluate_performance(model, wave["df"], wave["name"]))
+
+    # 6. Trigger-Logik
+    reasons = []
+    max_psi = psi_df["psi"].max()
+    if max_psi >= PSI_CRITICAL:
+        worst = psi_df.loc[psi_df["psi"].idxmax()]
+        reasons.append(f"PSI={max_psi:.4f} für '{worst['feature']}' in '{worst['wave']}' > {PSI_CRITICAL}")
+    if perf_rows:
+        last_f1 = perf_rows[-1]["f1"]
+        f1_drop_val = F1_REF - last_f1
+        if f1_drop_val >= F1_DROP:
+            reasons.append(f"F1={last_f1:.4f} (Abfall {f1_drop_val:.4f} >= Schwelle {F1_DROP})")
+    triggered = bool(reasons)
+
+    # 7. Ergebnisse ausgeben
+    print(f"\n{'─'*50}")
+    print("PSI-Ergebnisse (max über alle Waves):")
+    for feat, val in psi_df.groupby("feature")["psi"].max().sort_values(ascending=False).items():
+        status = "KRITISCH" if val >= PSI_CRITICAL else "WARNUNG" if val >= PSI_WARN else "OK"
+        print(f"  {feat:<35} {val:.4f}  [{status}]")
+
+    if perf_rows:
+        print("\nModell-Performance:")
+        for r in perf_rows:
+            print(f"  {r['wave']:<30} F1={r['f1']:.4f}  AUC={r['roc_auc']:.4f}  "
+                  f"Recall={r['recall']:.4f}  Precision={r['precision']:.4f}")
+
+    print(f"\nRetraining-Trigger: {'JA' if triggered else 'NEIN'}")
+    for r in reasons:
+        print(f"  → {r}")
+    print(f"{'─'*50}")
+
+    # 8. Plots speichern
+    plot_psi(psi_df)
+    plot_performance(perf_rows)
+
+    # 9. PSI-Ergebnisse als CSV speichern
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    psi_df.to_csv(REPORTS_DIR / "psi_summary.csv", index=False)
+
+    # 10. Retraining starten
+    if triggered and auto_retrain:
+        print("\nStarte automatisches Retraining ...")
+        result = subprocess.run(
+            [sys.executable, "src/training/retrain.py", "--waves"] + [str(p) for p in wave_paths]
+        )
+        print("Retraining abgeschlossen." if result.returncode == 0
+              else f"Retraining fehlgeschlagen (Exit {result.returncode}).")
+    elif triggered:
+        print("\nTrigger aktiv, aber --no-retrain gesetzt.")
+        print("Manuell: python src/training/retrain.py --waves <wave_paths>")
+
+    return {"triggered": triggered, "reasons": reasons, "max_psi": max_psi}
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="MLOps Monitoring – Drift-Erkennung")
+    parser.add_argument("--waves", nargs="+", type=Path, required=True,
+                        help="Production-Wave CSV-Dateien")
+    parser.add_argument("--no-retrain", action="store_true",
+                        help="Trigger melden, retrain.py aber NICHT aufrufen")
+    args = parser.parse_args()
+    run_monitoring(args.waves, auto_retrain=not args.no_retrain)
