@@ -1,0 +1,7 @@
+feature,wave,psi
+transaction_volume,Production Wave 1,0.0016
+processing_time_hours,Production Wave 1,0.0031
+historical_incidents_90d,Production Wave 1,0.0002
+open_cases_count,Production Wave 1,0.0032
+customer_tenure_months,Production Wave 1,0.0038
+change_requests_30d,Production Wave 1,0.0011

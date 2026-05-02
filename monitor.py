@@ -113,28 +113,21 @@ def log_inference(model_version: str, wave_name: str, df: pd.DataFrame, model):
 # Plots
 # ---------------------------------------------------------------------------
 def plot_psi(psi_df: pd.DataFrame, suffix: str = ""):
-    """Balkendiagramm: PSI pro Feature, eine Spalte pro Wave."""
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     waves    = psi_df["wave"].unique()
-    n        = len(waves)
     features = psi_df.groupby("feature")["psi"].max().sort_values().index
-
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, max(3, len(features) * 0.45)), sharey=True)
-    if n == 1:
+    fig, axes = plt.subplots(1, len(waves), figsize=(5 * len(waves), max(3, len(features) * 0.45)), sharey=True)
+    if len(waves) == 1:
         axes = [axes]
-
     for ax, wave in zip(axes, waves):
-        df     = psi_df[psi_df["wave"] == wave].set_index("feature")["psi"].reindex(features)
-        colors = ["#E53935" if v >= PSI_CRITICAL else "#FB8C00" if v >= PSI_WARN else "#43A047"
-                  for v in df.values]
-        ax.barh(df.index, df.values, color=colors, height=0.6)
-        ax.axvline(PSI_WARN,     linestyle="--", color="#FB8C00", linewidth=1.2, label=f"Warn ({PSI_WARN})")
-        ax.axvline(PSI_CRITICAL, linestyle="--", color="#E53935", linewidth=1.2, label=f"Kritisch ({PSI_CRITICAL})")
+        vals = psi_df[psi_df["wave"] == wave].set_index("feature")["psi"].reindex(features)
+        ax.barh(vals.index, vals.values, color="steelblue")
+        ax.axvline(PSI_WARN,     linestyle="--", color="orange", label=f"Warn ({PSI_WARN})")
+        ax.axvline(PSI_CRITICAL, linestyle="--", color="red",    label=f"Kritisch ({PSI_CRITICAL})")
         ax.set_xlabel("PSI")
-        ax.set_title(wave, fontweight="bold")
+        ax.set_title(wave)
         ax.legend(fontsize=8)
-
-    fig.suptitle("PSI pro Feature", fontsize=12, fontweight="bold")
+    fig.suptitle("PSI pro Feature")
     fig.tight_layout()
     path = REPORTS_DIR / f"psi{suffix}.png"
     fig.savefig(path, dpi=120, bbox_inches="tight")
@@ -143,21 +136,19 @@ def plot_psi(psi_df: pd.DataFrame, suffix: str = ""):
 
 
 def plot_performance(perf_rows: list, f1_ref: float, suffix: str = ""):
-    """Liniendiagramm: F1, Recall, Precision, AUC über alle Waves."""
     if not perf_rows:
         return
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(perf_rows)
     fig, ax = plt.subplots(figsize=(7, 4))
-    for metric, color in [("f1", "#2196F3"), ("recall", "#4CAF50"),
-                          ("precision", "#FF9800"), ("roc_auc", "#9C27B0")]:
-        ax.plot(df["wave"], df[metric], "-o", color=color, linewidth=2, label=metric.upper())
-    ax.axhline(f1_ref,           linestyle="--", color="#E53935", linewidth=1.2, label=f"F1-Ref ({f1_ref:.4f})")
-    ax.axhline(f1_ref - F1_DROP, linestyle=":",  color="#E53935", linewidth=1.0, label=f"Trigger ({f1_ref - F1_DROP:.4f})")
+    for metric in ["f1", "recall", "precision", "roc_auc"]:
+        ax.plot(df["wave"], df[metric], "-o", label=metric.upper())
+    ax.axhline(f1_ref,           linestyle="--", color="red", label=f"F1-Ref ({f1_ref:.4f})")
+    ax.axhline(f1_ref - F1_DROP, linestyle=":",  color="red", label=f"Trigger ({f1_ref - F1_DROP:.4f})")
     ax.set_ylim(0, 1)
-    ax.set_title("Modell-Performance im Zeitverlauf", fontweight="bold")
+    ax.set_title("Modell-Performance im Zeitverlauf")
     ax.legend(fontsize=8)
-    ax.grid(axis="y", alpha=0.25)
+    ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     path = REPORTS_DIR / f"performance{suffix}.png"
     fig.savefig(path, dpi=120, bbox_inches="tight")
@@ -260,13 +251,10 @@ def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
         print(f"  → {r}")
     print(f"{'─'*50}")
 
-    # 8. Kumulative Plots – wave1 zeigt nur wave1, wave2 zeigt wave1+2, usw.
-    wave_names = [w["name"] for w in waves]
-    for i, wave in enumerate(waves):
-        suffix       = f"_{wave['stem']}"
-        waves_so_far = wave_names[: i + 1]
-        plot_psi(psi_df[psi_df["wave"].isin(waves_so_far)], suffix=suffix)
-        plot_performance([r for r in perf_rows if r["wave"] in waves_so_far], f1_ref, suffix=suffix)
+    # 8. Plots – PSI für aktuelle Wave, Performance kumulativ aus Log
+    for wave in waves:
+        plot_psi(psi_df[psi_df["wave"] == wave["name"]], suffix=f"_{wave['stem']}")
+    plot_performance(all_perf_rows, f1_ref, suffix=f"_{waves[-1]['stem']}")
 
     # 9. PSI-Ergebnisse als CSV speichern
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
