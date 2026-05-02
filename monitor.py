@@ -180,6 +180,7 @@ def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
 
     # 2. Production Waves laden
     waves = [{"name": p.stem.replace("_", " ").title(),
+              "stem": p.stem,
               "df":   pd.read_csv(p, parse_dates=["timestamp"])}
              for p in wave_paths]
     for w in waves:
@@ -261,8 +262,8 @@ def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
 
     # 8. Kumulative Plots – wave1 zeigt nur wave1, wave2 zeigt wave1+2, usw.
     wave_names = [w["name"] for w in waves]
-    for i in range(len(wave_names)):
-        suffix       = f"_wave{i + 1}"
+    for i, wave in enumerate(waves):
+        suffix       = f"_{wave['stem']}"
         waves_so_far = wave_names[: i + 1]
         plot_psi(psi_df[psi_df["wave"].isin(waves_so_far)], suffix=suffix)
         plot_performance([r for r in perf_rows if r["wave"] in waves_so_far], f1_ref, suffix=suffix)
