@@ -4,7 +4,10 @@ Monitoring Pipeline – Drift-Erkennung & Retraining-Trigger
 PSI < 0.10    → stabil
 PSI 0.10–0.25 → Warnung
 PSI > 0.25    → kritischer Drift → retrain.py wird aufgerufen
-F1-Abfall >= 5% → retrain.py wird aufgerufen
+F1-Abfall >= 3% → retrain.py wird aufgerufen
+
+F1_REF wird dynamisch aus dem aktuellen Production-Modell in MLflow geladen.
+Die Plots bauen sich kumulativ auf: wave1 zeigt nur wave1, wave2 zeigt wave1+2, usw.
 
 Usage:
     python monitor.py --waves data/raw/production_wave_2.csv data/raw/production_wave_3.csv
@@ -37,8 +40,8 @@ INFERENCE_LOG = Path("logs/inference_log.csv")
 
 PSI_WARN      = 0.10
 PSI_CRITICAL  = 0.25
-F1_DROP       = 0.05
-F1_REF        = 0.564
+F1_DROP       = 0.03 # Trigger bei F1-Abfall von 3 Prozentpunkten, sonst zu viele verlorerene Kunden
+
 
 NUMERIC_FEATURES = [
     "transaction_volume", "processing_time_hours",
@@ -55,8 +58,7 @@ ALL_FEATURES = NUMERIC_FEATURES + [
 # PSI – misst wie stark sich eine Feature-Verteilung verändert hat
 # Vorgehen:
 #   1. Referenz (Training) in 10 Bins aufteilen
-#   2. Anteil der Werte pro Bin berechnen (ref_pct / cur_pct)
-#   3. PSI = Σ (cur - ref) * log(cur / ref)
+#   2. Anteil der Werte pro Bin berechnen
 # ---------------------------------------------------------------------------
 def compute_psi(reference: pd.Series, current: pd.Series, bins: int = 10) -> float:
     breakpoints = np.unique(np.percentile(reference.dropna(), np.linspace(0, 100, bins + 1)))
@@ -110,7 +112,7 @@ def log_inference(model_version: str, wave_name: str, df: pd.DataFrame, model):
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
-def plot_psi(psi_df: pd.DataFrame):
+def plot_psi(psi_df: pd.DataFrame, suffix: str = ""):
     """Balkendiagramm: PSI pro Feature, eine Spalte pro Wave."""
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     waves    = psi_df["wave"].unique()
@@ -134,13 +136,13 @@ def plot_psi(psi_df: pd.DataFrame):
 
     fig.suptitle("PSI pro Feature", fontsize=12, fontweight="bold")
     fig.tight_layout()
-    path = REPORTS_DIR / "psi.png"
+    path = REPORTS_DIR / f"psi{suffix}.png"
     fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     print(f"Plot gespeichert: {path}")
 
 
-def plot_performance(perf_rows: list):
+def plot_performance(perf_rows: list, f1_ref: float, suffix: str = ""):
     """Liniendiagramm: F1, Recall, Precision, AUC über alle Waves."""
     if not perf_rows:
         return
@@ -150,14 +152,14 @@ def plot_performance(perf_rows: list):
     for metric, color in [("f1", "#2196F3"), ("recall", "#4CAF50"),
                           ("precision", "#FF9800"), ("roc_auc", "#9C27B0")]:
         ax.plot(df["wave"], df[metric], "-o", color=color, linewidth=2, label=metric.upper())
-    ax.axhline(F1_REF,           linestyle="--", color="#E53935", linewidth=1.2, label=f"F1-Ref ({F1_REF})")
-    ax.axhline(F1_REF - F1_DROP, linestyle=":",  color="#E53935", linewidth=1.0, label=f"Trigger ({F1_REF - F1_DROP:.2f})")
+    ax.axhline(f1_ref,           linestyle="--", color="#E53935", linewidth=1.2, label=f"F1-Ref ({f1_ref:.4f})")
+    ax.axhline(f1_ref - F1_DROP, linestyle=":",  color="#E53935", linewidth=1.0, label=f"Trigger ({f1_ref - F1_DROP:.4f})")
     ax.set_ylim(0, 1)
     ax.set_title("Modell-Performance im Zeitverlauf", fontweight="bold")
     ax.legend(fontsize=8)
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
-    path = REPORTS_DIR / "performance.png"
+    path = REPORTS_DIR / f"performance{suffix}.png"
     fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     print(f"Plot gespeichert: {path}")
@@ -183,9 +185,10 @@ def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
     for w in waves:
         print(f"{w['name']}: {len(w['df']):,} Zeilen")
 
-    # 3. Modell aus MLflow laden
+    # 3. Modell aus MLflow laden + F1_REF aus Trainings-Run-Metriken
     model         = None
     model_version = "unbekannt"
+    f1_ref        = None
     try:
         import mlflow.sklearn
         import mlflow
@@ -194,9 +197,16 @@ def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
         version       = client.get_model_version_by_alias(MODEL_NAME, "production")
         model_version = f"v{version.version}"
         model         = mlflow.sklearn.load_model(f"runs:/{version.run_id}/model")
+        run           = client.get_run(version.run_id)
+        f1_ref        = run.data.metrics.get("test_f1")
+        if f1_ref is None:
+            print("WARNUNG: F1-Metrik nicht im MLflow-Run gefunden, verwende Fallback 0.564")
+            f1_ref = 0.564
         print(f"\nModell geladen: {MODEL_NAME}@production ({model_version})")
+        print(f"F1-Referenz (aus Production-Run): {f1_ref:.4f}")
     except Exception as e:
         print(f"\nWARNUNG: Modell nicht geladen ({e})")
+        f1_ref = 0.564
 
     # 4. PSI pro Feature & Wave berechnen
     psi_rows = []
@@ -217,7 +227,8 @@ def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
                 perf_rows.append(evaluate_performance(model, wave["df"], wave["name"]))
             log_inference(model_version, wave["name"], wave["df"], model)
 
-    # 6. Trigger-Logik
+    # 6. Trigger-Logik -- Schwellwerte Definition
+    # 
     reasons = []
     max_psi = psi_df["psi"].max()
     if max_psi >= PSI_CRITICAL:
@@ -225,7 +236,7 @@ def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
         reasons.append(f"PSI={max_psi:.4f} für '{worst['feature']}' in '{worst['wave']}' > {PSI_CRITICAL}")
     if perf_rows:
         last_f1     = perf_rows[-1]["f1"]
-        f1_drop_val = F1_REF - last_f1
+        f1_drop_val = f1_ref - last_f1
         if f1_drop_val >= F1_DROP:
             reasons.append(f"F1={last_f1:.4f} (Abfall {f1_drop_val:.4f} >= Schwelle {F1_DROP})")
     triggered = bool(reasons)
@@ -248,9 +259,13 @@ def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
         print(f"  → {r}")
     print(f"{'─'*50}")
 
-    # 8. Plots speichern
-    plot_psi(psi_df)
-    plot_performance(perf_rows)
+    # 8. Kumulative Plots – wave1 zeigt nur wave1, wave2 zeigt wave1+2, usw.
+    wave_names = [w["name"] for w in waves]
+    for i in range(len(wave_names)):
+        suffix       = f"_wave{i + 1}"
+        waves_so_far = wave_names[: i + 1]
+        plot_psi(psi_df[psi_df["wave"].isin(waves_so_far)], suffix=suffix)
+        plot_performance([r for r in perf_rows if r["wave"] in waves_so_far], f1_ref, suffix=suffix)
 
     # 9. PSI-Ergebnisse als CSV speichern
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
