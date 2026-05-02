@@ -36,7 +36,8 @@ TRACKING_URI  = "http://46.225.163.17:5000"
 MODEL_NAME    = "LGBM-RiskClassification"
 TRAIN_PATH    = Path("data/raw/train_full.csv")
 REPORTS_DIR   = Path("reports")
-INFERENCE_LOG = Path("logs/inference_log.csv")
+INFERENCE_LOG   = Path("logs/inference_log.csv")
+PERFORMANCE_LOG = Path("logs/performance_log.csv")
 
 PSI_WARN      = 0.10
 PSI_CRITICAL  = 0.25
@@ -216,8 +217,20 @@ def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
     if model:
         for wave in waves:
             if "risk_flag" in wave["df"].columns:
-                perf_rows.append(evaluate_performance(model, wave["df"], wave["name"]))
+                row = evaluate_performance(model, wave["df"], wave["name"])
+                perf_rows.append(row)
+                PERFORMANCE_LOG.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame([row]).to_csv(
+                    PERFORMANCE_LOG, mode="a",
+                    header=not PERFORMANCE_LOG.exists(), index=False
+                )
             log_inference(model_version, wave["name"], wave["df"], model)
+
+    # Alle bisher gespeicherten Metriken laden (für kumulativen Plot)
+    if PERFORMANCE_LOG.exists():
+        all_perf_rows = pd.read_csv(PERFORMANCE_LOG).drop_duplicates(subset=["wave"], keep="last").to_dict("records")
+    else:
+        all_perf_rows = perf_rows
 
     # 6. Trigger-Logik -- Schwellwerte Definition
     # 
