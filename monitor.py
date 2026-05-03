@@ -36,8 +36,9 @@ TRACKING_URI  = "http://46.225.163.17:5000"
 MODEL_NAME    = "LGBM-RiskClassification"
 TRAIN_PATH    = Path("data/raw/train_full.csv")
 REPORTS_DIR   = Path("reports")
-INFERENCE_LOG   = Path("logs/inference_log.csv")
-PERFORMANCE_LOG = Path("logs/performance_log.csv")
+INFERENCE_LOG    = Path("logs/inference_log.csv")
+PERFORMANCE_LOG  = Path("logs/performance_log.csv")
+WAVE_HISTORY_LOG = Path("logs/processed_waves.txt")
 
 PSI_WARN      = 0.10
 PSI_CRITICAL  = 0.25
@@ -158,6 +159,76 @@ def plot_performance(perf_rows: list, f1_ref: float, suffix: str = ""):
 
 
 # ---------------------------------------------------------------------------
+# Einzelne Wave überwachen (intern genutzt)
+# ---------------------------------------------------------------------------
+def _monitor_single_wave(wave: dict, train_df: pd.DataFrame, model, model_version: str,
+                          f1_ref: float, all_perf_rows: list) -> dict:
+    """Prüft eine einzelne Wave auf PSI-Drift und F1-Abfall. Gibt Trigger-Ergebnis zurück."""
+    wave_name = wave["name"]
+    wave_stem = wave["stem"]
+
+    # PSI berechnen
+    psi_rows = []
+    for feat in NUMERIC_FEATURES:
+        psi_rows.append({
+            "feature": feat,
+            "wave":    wave_name,
+            "psi":     round(compute_psi(train_df[feat], wave["df"][feat]), 4),
+        })
+    psi_df = pd.DataFrame(psi_rows)
+
+    # Performance & Inference Logging
+    perf_row = None
+    if model:
+        if "risk_flag" in wave["df"].columns:
+            perf_row = evaluate_performance(model, wave["df"], wave_name)
+            PERFORMANCE_LOG.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([perf_row]).to_csv(
+                PERFORMANCE_LOG, mode="a",
+                header=not PERFORMANCE_LOG.exists(), index=False
+            )
+            all_perf_rows.append(perf_row)
+        log_inference(model_version, wave_name, wave["df"], model)
+
+    # Trigger-Logik
+    reasons = []
+    max_psi = psi_df["psi"].max()
+    if max_psi >= PSI_CRITICAL:
+        worst = psi_df.loc[psi_df["psi"].idxmax()]
+        reasons.append(f"PSI={max_psi:.4f} für '{worst['feature']}' in '{worst['wave']}' > {PSI_CRITICAL}")
+    if perf_row:
+        f1_drop_val = f1_ref - perf_row["f1"]
+        if f1_drop_val >= F1_DROP:
+            reasons.append(f"F1={perf_row['f1']:.4f} (Abfall {f1_drop_val:.4f} >= Schwelle {F1_DROP})")
+    triggered = bool(reasons)
+
+    # Ausgabe
+    print(f"\n{'─'*50}")
+    print(f"Wave: {wave_name}")
+    print("PSI-Ergebnisse:")
+    for feat, val in psi_df.set_index("feature")["psi"].sort_values(ascending=False).items():
+        status = "KRITISCH" if val >= PSI_CRITICAL else "WARNUNG" if val >= PSI_WARN else "OK"
+        print(f"  {feat:<35} {val:.4f}  [{status}]")
+    if perf_row:
+        print(f"  Performance: F1={perf_row['f1']:.4f}  AUC={perf_row['roc_auc']:.4f}  "
+              f"Recall={perf_row['recall']:.4f}  Precision={perf_row['precision']:.4f}")
+    print(f"Retraining-Trigger: {'JA' if triggered else 'NEIN'}")
+    for r in reasons:
+        print(f"  → {r}")
+    print(f"{'─'*50}")
+
+    # Plots
+    plot_psi(psi_df, suffix=f"_{wave_stem}")
+    plot_performance(all_perf_rows, f1_ref, suffix=f"_{wave_stem}")
+
+    # PSI als CSV speichern
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    psi_df.to_csv(REPORTS_DIR / f"psi_summary_{wave_stem}.csv", index=False)
+
+    return {"triggered": triggered, "reasons": reasons, "max_psi": max_psi}
+
+
+# ---------------------------------------------------------------------------
 # Hauptpipeline
 # ---------------------------------------------------------------------------
 def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
@@ -201,91 +272,66 @@ def run_monitoring(wave_paths: list[Path], auto_retrain: bool = True):
         print(f"\nWARNUNG: Modell nicht geladen ({e})")
         f1_ref = 0.564
 
-    # 4. PSI pro Feature & Wave berechnen
-    psi_rows = []
-    for wave in waves:
-        for feat in NUMERIC_FEATURES:
-            psi_rows.append({
-                "feature": feat,
-                "wave":    wave["name"],
-                "psi":     round(compute_psi(train_df[feat], wave["df"][feat]), 4),
-            })
-    psi_df = pd.DataFrame(psi_rows)
-
-    # 5. Performance & Inference Logging pro Wave (nur wenn Modell geladen)
-    perf_rows = []
-    if model:
-        for wave in waves:
-            if "risk_flag" in wave["df"].columns:
-                row = evaluate_performance(model, wave["df"], wave["name"])
-                perf_rows.append(row)
-                PERFORMANCE_LOG.parent.mkdir(parents=True, exist_ok=True)
-                pd.DataFrame([row]).to_csv(
-                    PERFORMANCE_LOG, mode="a",
-                    header=not PERFORMANCE_LOG.exists(), index=False
-                )
-            log_inference(model_version, wave["name"], wave["df"], model)
-
-    # Alle bisher gespeicherten Metriken laden (für kumulativen Plot)
-    if PERFORMANCE_LOG.exists():
-        all_perf_rows = pd.read_csv(PERFORMANCE_LOG).drop_duplicates(subset=["wave"], keep="last").to_dict("records")
+    # 4. Sequenzielles Wave-by-Wave Monitoring mit kumulativem Retraining
+    # Wave-History laden (für sequenziellen CLI-Modus)
+    WAVE_HISTORY_LOG.parent.mkdir(parents=True, exist_ok=True)
+    if WAVE_HISTORY_LOG.exists():
+        historical_waves = [Path(p.strip()) for p in WAVE_HISTORY_LOG.read_text().splitlines() if p.strip()]
     else:
-        all_perf_rows = perf_rows
+        historical_waves = []
 
-    # 6. Trigger-Logik -- Schwellwerte Definition
-    # 
-    reasons = []
-    max_psi = psi_df["psi"].max()
-    if max_psi >= PSI_CRITICAL:
-        worst = psi_df.loc[psi_df["psi"].idxmax()]
-        reasons.append(f"PSI={max_psi:.4f} für '{worst['feature']}' in '{worst['wave']}' > {PSI_CRITICAL}")
-    if perf_rows:
-        last_f1     = perf_rows[-1]["f1"]
-        f1_drop_val = f1_ref - last_f1
-        if f1_drop_val >= F1_DROP:
-            reasons.append(f"F1={last_f1:.4f} (Abfall {f1_drop_val:.4f} >= Schwelle {F1_DROP})")
-    triggered = bool(reasons)
+    all_perf_rows = []
+    last_result   = {"triggered": False, "reasons": [], "max_psi": 0.0}
 
-    # 7. Ergebnisse ausgeben
-    print(f"\n{'─'*50}")
-    print("PSI-Ergebnisse (max über alle Waves):")
-    for feat, val in psi_df.groupby("feature")["psi"].max().sort_values(ascending=False).items():
-        status = "KRITISCH" if val >= PSI_CRITICAL else "WARNUNG" if val >= PSI_WARN else "OK"
-        print(f"  {feat:<35} {val:.4f}  [{status}]")
+    for i, wave in enumerate(waves):
+        # Bisherige Waves aus History + alle bereits in diesem Lauf verarbeiteten + aktuelle
+        waves_so_far = historical_waves + list(wave_paths[: i + 1])
 
-    if perf_rows:
-        print("\nModell-Performance:")
-        for r in perf_rows:
-            print(f"  {r['wave']:<30} F1={r['f1']:.4f}  AUC={r['roc_auc']:.4f}  "
-                  f"Recall={r['recall']:.4f}  Precision={r['precision']:.4f}")
+        print(f"\n{'='*60}")
+        print(f"Schritt {i+1}/{len(waves)}: {wave['name']}")
+        print(f"{'='*60}")
 
-    print(f"\nRetraining-Trigger: {'JA' if triggered else 'NEIN'}")
-    for r in reasons:
-        print(f"  → {r}")
-    print(f"{'─'*50}")
+        result = _monitor_single_wave(wave, train_df, model, model_version, f1_ref, all_perf_rows)
+        last_result = result
 
-    # 8. Plots – PSI für aktuelle Wave, Performance kumulativ aus Log
-    for wave in waves:
-        plot_psi(psi_df[psi_df["wave"] == wave["name"]], suffix=f"_{wave['stem']}")
-    plot_performance(all_perf_rows, f1_ref, suffix=f"_{waves[-1]['stem']}")
+        # 5. Retraining mit allen bisherigen Waves, dann weiter zur nächsten Wave
+        if result["triggered"] and auto_retrain:
+            print(f"\nStarte Retraining mit {len(waves_so_far)} Wave(s): "
+                  f"{[p.name for p in waves_so_far]}")
+            subprocess_result = subprocess.run(
+                [sys.executable, "src/training/retrain.py", "--waves"]
+                + [str(p) for p in waves_so_far]
+            )
+            if subprocess_result.returncode == 0:
+                print("Retraining abgeschlossen. Lade aktualisiertes Modell ...")
+                # Modell & F1-Referenz nach Retraining neu laden
+                try:
+                    import mlflow
+                    mlflow.set_tracking_uri(TRACKING_URI)
+                    client        = mlflow.MlflowClient()
+                    version       = client.get_model_version_by_alias(MODEL_NAME, "production")
+                    model_version = f"v{version.version}"
+                    model         = mlflow.sklearn.load_model(f"runs:/{version.run_id}/model")
+                    run           = client.get_run(version.run_id)
+                    f1_ref        = run.data.metrics.get("test_f1") or f1_ref
+                    print(f"Neues Modell geladen: {model_version}, F1-Ref: {f1_ref:.4f}")
+                except Exception as e:
+                    print(f"WARNUNG: Modell-Reload fehlgeschlagen ({e}), fahre mit altem Modell fort.")
+            else:
+                print(f"Retraining fehlgeschlagen (Exit {subprocess_result.returncode}).")
+        elif result["triggered"]:
+            print(f"\nTrigger aktiv, aber --no-retrain gesetzt.")
+            print(f"Manuell: python src/training/retrain.py --waves "
+                  f"{' '.join(str(p) for p in waves_so_far)}")
 
-    # 9. PSI-Ergebnisse als CSV speichern
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    psi_df.to_csv(REPORTS_DIR / "psi_summary.csv", index=False)
+        # Wave in History schreiben (nur wenn noch nicht vorhanden)
+        wave_path = wave_paths[i]
+        if wave_path not in historical_waves:
+            with open(WAVE_HISTORY_LOG, "a") as f:
+                f.write(str(wave_path) + "\n")
+            historical_waves.append(wave_path)
 
-    # 10. Retraining starten
-    if triggered and auto_retrain:
-        print("\nStarte automatisches Retraining ...")
-        result = subprocess.run(
-            [sys.executable, "src/training/retrain.py", "--waves"] + [str(p) for p in wave_paths]
-        )
-        print("Retraining abgeschlossen." if result.returncode == 0
-              else f"Retraining fehlgeschlagen (Exit {result.returncode}).")
-    elif triggered:
-        print("\nTrigger aktiv, aber --no-retrain gesetzt.")
-        print("Manuell: python src/training/retrain.py --waves <wave_paths>")
-
-    return {"triggered": triggered, "reasons": reasons, "max_psi": max_psi}
+    return last_result
 
 
 # ---------------------------------------------------------------------------
