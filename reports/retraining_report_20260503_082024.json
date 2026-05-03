@@ -1,0 +1,26 @@
+{
+  "data_sources": [
+    "data/raw/production_wave_1.csv",
+    "data/raw/production_wave_2.csv"
+  ],
+  "total_samples": 21000,
+  "champion": {
+    "version": "3",
+    "run_id": "ee140231668646109551498c59877a7b",
+    "f1": 0.563570784490532,
+    "precision": 0.5127153404429861,
+    "recall": 0.6256256256256256,
+    "roc_auc": 0.7158988073530803
+  },
+  "challenger": {
+    "run_id": "73c7b83fc3a04a178605801fad93e6b7",
+    "val_f1": 0.7884992376388587,
+    "val_precision": 0.6814759036144579,
+    "val_recall": 0.9354005167958657,
+    "val_roc_auc": 0.7726638381131634
+  },
+  "promotion_decision": true,
+  "promotion_reason": "Challenger \u00fcbertrifft Champion: F1 0.564 \u2192 0.788 (\u0394=+0.225)",
+  "promoted_version": "5",
+  "timestamp": "20260503_082024"
+}
