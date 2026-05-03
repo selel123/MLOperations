@@ -1,51 +1,63 @@
 # MLOps Project
+A structured MLOps pipeline for risk flag classification, covering data processing, model training, serving, batch prediction, monitoring, and retraining.
 
-A structured MLOps project covering data processing, model training, serving, batch prediction, monitoring, and retraining.
+# Project Structure
 
-## Project Structure
-
-```
-mlops-project/
+MLOps/
 ├── data/
-│   ├── raw/          # Raw, immutable data
-│   └── processed/    # Cleaned and transformed data
+│   ├── raw/                    # Raw, immutable data (CSV waves)
+│   └── processed/              # Cleaned and transformed data
 ├── notebooks/
-│   └── 01_eda.ipynb  # Exploratory Data Analysis
+│   └── 01_eda.ipynb            # Exploratory Data Analysis
 ├── src/
-│   ├── data/         # Data loading and preprocessing
-│   ├── features/     # Feature engineering
-│   ├── training/     # Model training logic
-│   └── inference/    # Inference/prediction logic
-├── reports/          # Generated reports and metrics
-├── logs/             # Application and training logs
-├── train.py          # Entry point: train a model
-├── serve.py          # Entry point: serve model via API
-├── predict_batch.py  # Entry point: batch predictions
-├── monitor.py        # Entry point: monitor model performance
-└── retrain.py        # Entry point: trigger retraining
-```
+│   ├── training/
+│   │   ├── train.py            # Model training logic
+│   │   └── retrain.py          # Retraining logic
+│   └── inference/
+│       ├── serve.py            # FastAPI serving logic
+│       └── predict_batch.py    # Batch prediction logic
+├── reports/
+│   ├── model_card.py           # Model card generation
+│   ├── monitoring_retrain/     # Monitoring plots & retraining reports
+│   └── docs/                   # PDF reports and feature importance
+├── logs/
+│   └── inference_log.csv       # Inference log
+├── mlruns/                     # MLflow experiment tracking
+├── mlflow.db                   # MLflow backend store
+├── monitor.py                  # Entry point: monitor model performance
+└── pyproject.toml              # Project dependencies
+Setup
 
-## Setup
+# Create and activate virtual environment
+uv sync
 
-```bash
-pip install -r requirements.txt
-```
+# Or with pip
+pip install -e .
+Usage
 
-## Usage
+# Train baseline model
+python src/training/train.py
 
-```bash
-# Train
-python train.py
+# Serve model via FastAPI
+python src/inference/serve.py
 
-# Serve
-python serve.py
+# Run batch predictions
+python src/inference/predict_batch.py
 
-# Batch prediction
-python predict_batch.py
-
-# Monitor
+# Monitor model performance (PSI, drift, metrics)
 python monitor.py
 
-# Retrain
-python retrain.py
-```
+# Trigger retraining
+python src/training/retrain.py
+MLflow Tracking
+Experiments and model runs are tracked with MLflow. To launch the UI locally:
+
+
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+
+# Tech Stack
+ML: scikit-learn, LightGBM, XGBoost
+Tracking: MLflow
+Serving: FastAPI, Uvicorn
+Data: pandas, NumPy
+Analysis: matplotlib, seaborn, statsmodels
