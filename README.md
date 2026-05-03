@@ -93,13 +93,13 @@ Includes:
 - Metric tracking
 
 ```bash
-python monitor.py
+python monitor.py -- wave
 ```
 
-## Trigger retraining
+## Retraining is triggered automatically by monitor pipeline
 
 ```bash
-python src/training/retrain.py
+python src/training/retrain.py --wave
 ```
 
 ---
@@ -108,14 +108,8 @@ python src/training/retrain.py
 
 Experiments and model runs are tracked with MLflow.
 
-Launch the MLflow UI locally:
-
-```bash
-mlflow ui --backend-store-uri sqlite:///mlflow.db
-```
-
-Default UI:
-- http://127.0.0.1:5000
+Link to UI:
+- http://46.225.163.17:5000 
 
 ---
 
