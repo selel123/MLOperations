@@ -108,8 +108,7 @@ python src/training/retrain.py --wave
 
 Experiments and model runs are tracked with MLflow.
 
-Link to UI:
-
+[Link to UI](http://46.225.163.17:5000)
 ---
 
 # Tech Stack
